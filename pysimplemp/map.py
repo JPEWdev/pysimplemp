@@ -27,12 +27,16 @@
 # terminate at any point without deadlocking.
 
 import contextlib
+import logging
 import multiprocessing
 import os
 import signal
 import sys
+import time
 from .errors import ResultQueueEmpty
 from .util import sigmask
+
+logger = logging.getLogger("pysimplemp.map")
 
 
 class MapResult(object):
@@ -48,10 +52,25 @@ class MapResult(object):
 
 
 class MapPool(object):
+    MAX_WORKERS = 100000
+
+    # The job is ready to be executed
     STATE_READY = -1
-    STATE_IN_PROGRESS = -2
-    STATE_READING_RESULT = -3
-    STATE_FINISHED = -4
+
+    # The main process is reading the result from the worker queue
+    STATE_READING_RESULT = -2
+
+    # The job is finished
+    STATE_FINISHED = -3
+
+    # A worker process is currently processing the job. The index of the
+    # worker process can found by subtracting STATE_IN_PROGRESS from the value
+    STATE_IN_PROGRESS = MAX_WORKERS
+
+    # A worker process has (or will) write the result to it's result queue.
+    # The index of the worker process can be found by subtracting
+    # STATE_QUEUEING_RESULT
+    STATE_QUEUEING_RESULT = STATE_IN_PROGRESS + MAX_WORKERS
 
     def __init__(
         self,
@@ -110,21 +129,11 @@ class MapPool(object):
         self.result_queues = []
         self.result_semaphore = self.ctx.Semaphore(0)
         self.processes = []
-        self.num_processes = num_processes or multiprocessing.cpu_count()
+        self.num_processes = min(
+            num_processes or multiprocessing.cpu_count(), self.MAX_WORKERS
+        )
         self.init = init
         self.deinit = deinit
-
-        # Track the state of each job. The state can be one of the following
-        # values:
-        #   STATE_READY       - No worker has started processing the job yet
-        #   STATE_IN_PROGRESS - worker is currently processing the job
-        #   Any integer >= 0  - The worker process with the specified index has
-        #                       completed the job and may be waiting to write
-        #                       the result back
-        #   STATE_READING_RESULT  - The result is being read from the worker's
-        #                           queue by the main process
-        #   STATE_FINISHED    - The main process has read the result from the
-        #                       worker's result queue
         self.states = self.ctx.Array("i", [self.STATE_READY] * len(self.jobs))
 
     @contextlib.contextmanager
@@ -156,11 +165,11 @@ class MapPool(object):
             # termination signal to ensure that this is atomic and the process
             # isn't killed with the array lock held
             job_index = None
-            with self._sigblock(), self.states.get_lock():
-                for idx in range(len(self.states)):
-                    if self.states[idx] == self.STATE_READY:
+            with self._sigblock():
+                for idx, state, _ in self._foreach_state():
+                    if state == self.STATE_READY:
                         job_index = idx
-                        self.states[idx] = self.STATE_IN_PROGRESS
+                        self.states[idx] = self.STATE_IN_PROGRESS + worker_idx
                         break
 
             if job_index is None:
@@ -184,7 +193,7 @@ class MapPool(object):
             with self._sigblock():
                 # Mark the job as ready to be received by the main process
                 with self.states.get_lock():
-                    self.states[job_index] = worker_idx
+                    self.states[job_index] = self.STATE_QUEUEING_RESULT + worker_idx
 
                 # Signal there is an item ready to be processed
                 self.result_semaphore.release()
@@ -198,6 +207,23 @@ class MapPool(object):
     def __exit__(self, *args, **kwargs):
         self.terminate()
         self.join()
+
+    def _foreach_state(self):
+        with self.states.get_lock():
+            for idx in range(len(self.states)):
+                (state, worker_idx) = self._get_state(idx)
+                yield idx, state, worker_idx
+
+    def _get_state(self, idx):
+        v = self.states[idx]
+
+        if v >= self.STATE_IN_PROGRESS and v < self.STATE_QUEUEING_RESULT:
+            return (self.STATE_IN_PROGRESS, v - self.STATE_IN_PROGRESS)
+
+        if v >= self.STATE_QUEUEING_RESULT:
+            return (self.STATE_QUEUEING_RESULT, v - self.STATE_QUEUEING_RESULT)
+
+        return (v, None)
 
     def results(self, block=True):
         """
@@ -232,7 +258,7 @@ class MapPool(object):
         for i in range(len(self.jobs)):
             try:
                 while not i in results:
-                    result = self._get(block)
+                    result = self._get_next_result(block)
                     results[result.job_idx] = result
             except ResultQueueEmpty:
                 pass
@@ -270,35 +296,45 @@ class MapPool(object):
                     self.processes.append(pid)
                     self.result_queues.append(queue)
 
-    def _get(self, block):
-        worker_idx = None
+    def _get_next_result(self, block):
+        global logger
+
         # There a small race where join() may read items out of a result queue
         # before this code can change the state to STATE_READING_RESULT to
         # "reserve" it. In this case, the code needs to loop again (which will
         # most likely result in all states being STATE_FINISHED and raising
         # ResultQueueEmpty()). Not that for this to happen, join() must be
         # called on from a thread other than the one processing results.
-        while worker_idx is None:
-            with self.states.get_lock():
-                for idx in range(len(self.states)):
-                    if self.states[idx] != self.STATE_FINISHED:
-                        break
-                else:
+        while True:
+            # Find the queue that has the result, and mark is as being read
+            is_finished = True
+            worker_idx = None
+
+            for idx, state, widx in self._foreach_state():
+                if state == self.STATE_QUEUEING_RESULT:
+                    worker_idx = widx
+                    self.states[idx] = self.STATE_READING_RESULT
+                    logger.debug(
+                        "Reading result for job %i from worker %i" % (idx, worker_idx)
+                    )
+                    break
+                elif state != self.STATE_FINISHED:
+                    is_finished = False
+            else:
+                # If we didn't find a worker and all jobs are finished,
+                # raise the queue empty exception
+                if is_finished:
                     raise ResultQueueEmpty()
+
+            if worker_idx is not None:
+                break
 
             # Wait for any result to be ready
             if not self.result_semaphore.acquire(block):
                 raise ResultQueueEmpty()
 
-            # Find the queue that has the result, and mark is as being read
-            with self.states.get_lock():
-                for idx in range(len(self.states)):
-                    if self.states[idx] >= 0:
-                        worker_idx = self.states[idx]
-                        self.states[idx] = self.STATE_READING_RESULT
-                        break
-
         result = self.result_queues[worker_idx].get()
+        logger.debug("Done reading result")
 
         # Mark job as finished
         with self.states.get_lock():
@@ -319,14 +355,19 @@ class MapPool(object):
         a result is ready or there are no more results left. If `False` and the
         function would block, a `ResultQueueEmpty` exception is raised.
         """
-        return self._get(block).get()
+        return self._get_next_result(block).get()
 
     def terminate(self):
         """
         Terminate all worker processes. This must be called before `join()`
         """
-        for p in self.processes:
-            os.kill(p, signal.SIGTERM)
+        with self.states.get_lock():
+            for idx, state, worker_idx in self._foreach_state():
+                if state == self.STATE_READY:
+                    self.states[idx] = self.STATE_FINISHED
+
+            for p in self.processes:
+                os.kill(p, signal.SIGTERM)
 
     def join(self):
         """
@@ -335,18 +376,56 @@ class MapPool(object):
 
         Any results that have not been collected will be lost
         """
+        global logger
 
-        # Workers block the terminate signal while writing to their result
-        # queue. If they are blocked waiting for data to be read out of the
-        # queue, they will not be able to receive the terminate signal. Find
-        # all tasks
-        # cannot get the signal because it is blocked. Find them and
-        # read their result queues to unblock them so they can terminate
-        with self.states.get_lock():
-            for idx in range(len(self.states)):
-                if self.states[idx] >= 0:
-                    self.result_queues[self.states[idx]].get()
+        wait_pids = set(self.processes)
+
+        while True:
+            queue_reads = []
+            in_process_pids = set()
+
+            for idx, state, worker_idx in self._foreach_state():
+                if state == self.STATE_QUEUEING_RESULT:
+                    # Workers block the terminate signal while writing to their
+                    # result queue. If they are blocked waiting for data to be
+                    # read out of the queue, they will not be able to receive
+                    # the terminate signal. Find all tasks writing to their
+                    # result queue and read from it (discarding the results) to
+                    # unblock them
+                    logger.debug(
+                        "Discarding result for job %i from worker %i"
+                        % (idx, worker_idx)
+                    )
+                    self.result_queues[worker_idx].get()
+                    logger.debug("Done discarding")
                     self.states[idx] = self.STATE_FINISHED
+                elif state == self.STATE_IN_PROGRESS:
+                    # If this worker is still in progress, there are a few
+                    # possible options:
+                    # 1) The worker is still executing it's job (which may be
+                    #   uninterruptable)
+                    # 2) The worker has exited
+                    # 3) The worker has signals disabled and is waiting for the
+                    #   states lock to change the state to QUEUEING_RESULT
+                    #
+                    # If we detect a process in this state, we cannot block
+                    # when waiting for the process to terminate, otherwise it
+                    # could deadlock
+                    in_process_pids.add(self.processes[worker_idx])
 
-        for p in self.processes:
-            os.waitpid(p, 0)
+            new_wait_pids = set()
+            for pid in wait_pids:
+                logger.debug("Waiting for %d" % pid)
+                (wait_pid, status) = os.waitpid(
+                    pid, os.WNOHANG if pid in in_process_pids else 0
+                )
+                if (wait_pid, status) == (0, 0):
+                    new_wait_pids.add(pid)
+
+            if not new_wait_pids:
+                # No processes still pending.
+                break
+
+            wait_pids = new_wait_pids
+            logger.debug("PIDs %r are still running" % wait_pids)
+            time.sleep(0.1)
