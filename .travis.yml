@@ -1,12 +1,22 @@
 dist: bionic
 language: python
 python:
-  - "3.5"
-  - "3.6"
-  - "3.7"
-  - "3.8"
+- '3.5'
+- '3.6'
+- '3.7'
+- '3.8'
 install:
-  - [ $PYTHON = "3.5" ] || pip3 install black
+- |
+  [ $TRAVIS_PYTHON_VERSION = "3.5" ] || pip3 install black
 script:
-  - [ $PYTHON = "3.5" ] || black --check $(git ls-files '*.py')
-  - python3 -m unittest -vb
+- |
+  [ $TRAVIS_PYTHON_VERSION = "3.5" ] || black --check $(git ls-files '*.py')
+- python3 -m unittest -vb
+deploy:
+  provider: pypi
+  username: __token__
+  password:
+    secure: H6bwBGs1VcPDvYGRBF2HmMPrHFK/biEj89YKXVlPIbXBUMRJor73CbrKKw1lc2WXoxv4KANluM469KGxopTFbeL+v2JNmkMkLZn4eKZ5BcS2/7zz8nDr46uXw5t3xoHQDf1nOhz0NVEwJ4R7n0aftKPZTToX4nUFTZs1io4abBFNOP1EpcAgQ1zHOhkreR6l8m7i2hp+gGEfUyqZ5BKnrWrZYQA+MVes5naHe7OohESjWiB6lMk/skD+3vZGu3KoVejrSCajfxdLIViOITjCg6A0mD1uhJQew+ePZ4QsFdEF792DV3QLB/TNVow0geLg7hOoWSiid2uNLvozeOv9t+qk80czTK/6bzKC+bS18onU93H63nB4bwubCFWb9cGAIdmgqhhw/Xl2f5/y5/pDd03N8j3pC+JSNjDbEmxDht1H7lB2WcJ37YaPDFJsk/C/21dWzDJYUBeJ8UFpIcmfBJLAlWL6Qt9574VJZGS/Mk/AlJGW86j0bAhfeACQvUfYuaGVyJzLU6yBnJlnXe7SREn9qvCSydIXXQCy9peIO5O03GxiCSAui9f9pc89nbmzLg6JRhbjeoOoU4rpSL0b9GedcXj1nCC0fIDFJHWdFu9Ovr8umItGi4x4GeXSorYR4xX4yAl3OdqiNQHtXUp9+NO/vvdAKN/M3kRrCdvNPT0=
+  on:
+    tags: true
+

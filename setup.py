@@ -19,6 +19,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+VERSION = "0.1.dev0"
+
 import setuptools
 
 with open("README.md", "r") as f:
@@ -26,10 +28,11 @@ with open("README.md", "r") as f:
 
 setuptools.setup(
     name="pysimplemp",
-    version="0.1dev",
+    version=VERSION,
     author="Joshua Watt",
     author_email="JPEWhacker@gmail.com",
     url="https://github.com/JPEWdev/pysimplemp",
+    download_url="https://github.com/JPEWdev/pysimplemp/archive/%s.tar.gz" % VERSION,
     packages=setuptools.find_packages(),
     classifiers=(
         "Programming Language :: Python :: 3",

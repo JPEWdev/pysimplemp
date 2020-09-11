@@ -20,10 +20,14 @@
 # SOFTWARE.
 
 import multiprocessing
+import os
 import random
+import subprocess
 import time
 import unittest
 from . import MapPool, ResultQueueEmpty
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class TestJobException(Exception):
@@ -182,6 +186,19 @@ class MapPoolTests(unittest.TestCase):
             pass
 
         self.assertEqual(deinit_count.value, 0)
+
+    def test_version(self):
+        tag = os.environ.get("TRAVIS_TAG")
+        if not tag:
+            self.skipTest("'TRAVIS_TAG' not defined")
+
+        r = subprocess.run(
+            ["%s/../setup.py" % THIS_DIR, "-V"], check=True, stdout=subprocess.PIPE
+        )
+
+        self.assertEqual(
+            r.stdout.decode("utf-8").rstrip(), tag, "Tag and version do not match"
+        )
 
 
 if __name__ == "__main__":
